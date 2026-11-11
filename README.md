@@ -1,0 +1,1 @@
+LN-TR (Latent Noise-Scheduled Trajectory Regularization) framework for video models (Local set up : RTX 5050) using SSV2 dataset. Taking as baseline JEPA V2.

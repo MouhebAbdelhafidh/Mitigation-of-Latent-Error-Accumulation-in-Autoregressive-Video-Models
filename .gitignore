@@ -9,3 +9,9 @@ dist/
 build/
 *.egg-info/
 .venv/
+data/
+labels/
+clips/
+configs/test_subset.json
+configs/train_subset.json
+configs/val_subset.json
