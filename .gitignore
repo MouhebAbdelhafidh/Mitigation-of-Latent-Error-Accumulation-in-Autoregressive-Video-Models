@@ -12,6 +12,7 @@ build/
 data/
 labels/
 clips/
+outputs/
 configs/test_subset.json
 configs/train_subset.json
 configs/val_subset.json
