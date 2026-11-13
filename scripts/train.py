@@ -1,389 +1,285 @@
 import argparse
 import math
-import os
 from pathlib import Path
+
+import matplotlib
+
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
 import torch
+import torch.nn.functional as F
 from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
 
-from lntr.data.dataset import LatentSequenceDataset
+from lntr.data.dataset import LatentSequenceDataset, compute_latent_stats
 from lntr.losses.unified_loss import UnifiedLNTRLoss
 from lntr.models.forward_predictor import CausalLatentPredictor
 from lntr.models.reverse_head import ReverseCycleHead
 
-import matplotlib
-matplotlib.use('Agg')  # Non-interactive backend (no popup windows)
-import matplotlib.pyplot as plt
-
 
 def parse_args():
-    parser = argparse.ArgumentParser(
-        description="Phase 2 & 3: Optimized LN-TR Predictor Training"
-    )
-    parser.add_argument(
-        "--h5_train",
-        type=str,
-        default="cached_features/vjepa2_vitl_f32_r256/train_latents.h5",
-        help="Path to training latents HDF5.",
-    )
-    parser.add_argument(
-        "--h5_val",
-        type=str,
-        default="cached_features/vjepa2_vitl_f32_r256/val_latents.h5",
-        help="Path to validation latents HDF5.",
-    )
-    parser.add_argument(
-        "--epochs", type=int, default=50, help="Number of training epochs."
-    )
-    parser.add_argument(
-        "--batch_size",
-        type=int,
-        default=64,
-        help="Batch size (fits in ~2.0 GB VRAM).",
-    )
-    parser.add_argument(
-        "--lr", type=float, default=1.5e-4, help="AdamW base learning rate."
-    )
-    parser.add_argument(
-        "--weight_decay", type=float, default=0.01, help="AdamW weight decay."
-    )
-    parser.add_argument(
-        "--hidden_dim",
-        type=int,
-        default=512,
-        help="Hidden dimension size of predictor.",
-    )
-    parser.add_argument(
-        "--num_layers",
-        type=int,
-        default=6,
-        help="Number of Causal Transformer layers.",
-    )
-    parser.add_argument(
-        "--num_heads", type=int, default=8, help="Number of attention heads."
-    )
-    parser.add_argument(
-        "--lambda_noise",
-        type=float,
-        default=0.15,
-        help="Balanced weight for LSNI noise loss.",
-    )
-    parser.add_argument(
-        "--lambda_cycle",
-        type=float,
-        default=0.10,
-        help="Balanced weight for RLCC cycle loss.",
-    )
-    parser.add_argument(
-        "--k_steps", type=int, default=4, help="Reverse cycle rollout depth K."
-    )
-    parser.add_argument(
-        "--alpha_min",
-        type=float,
-        default=0.85,
-        help="Softer minimum noise coefficient alpha.",
-    )
-    parser.add_argument(
-        "--alpha_max",
-        type=float,
-        default=1.0,
-        help="Maximum noise coefficient alpha.",
-    )
-    parser.add_argument(
-        "--num_workers",
-        type=int,
-        default=4,
-        help="DataLoader multi-processing workers.",
-    )
-    parser.add_argument(
-        "--checkpoint_dir",
-        type=str,
-        default="checkpoints/optimized_lntr",
-        help="Directory to save model weights.",
-    )
-    parser.add_argument(
-        "--log_dir",
-        type=str,
-        default="outputs/tensorboard",
-        help="TensorBoard log directory.",
-    )
-    return parser.parse_args()
+    p = argparse.ArgumentParser(description="LN-TR predictor training (stabilized)")
+    p.add_argument("--h5_train", type=str, default="cached_features/vjepa2_vitl_f32_r256/train_latents.h5")
+    p.add_argument("--h5_val", type=str, default="cached_features/vjepa2_vitl_f32_r256/val_latents.h5")
+    p.add_argument("--epochs", type=int, default=50)
+    p.add_argument("--batch_size", type=int, default=64)
+    p.add_argument("--lr", type=float, default=1e-4)
+    p.add_argument("--beta2", type=float, default=0.95, help="AdamW beta2 (0.95 is spike-resistant).")
+    p.add_argument("--weight_decay", type=float, default=0.01)
+    p.add_argument("--warmup_steps", type=int, default=500)
+    p.add_argument("--grad_clip", type=float, default=1.0)
+    p.add_argument("--hidden_dim", type=int, default=512)
+    p.add_argument("--num_layers", type=int, default=6)
+    p.add_argument("--num_heads", type=int, default=8)
+    p.add_argument("--lambda_noise", type=float, default=0.15)
+    p.add_argument("--lambda_cycle", type=float, default=0.10)
+    p.add_argument("--k_steps", type=int, default=4)
+    p.add_argument("--alpha_min", type=float, default=0.85)
+    p.add_argument("--alpha_max", type=float, default=1.0)
+    p.add_argument("--num_workers", type=int, default=4)
+    p.add_argument("--seed", type=int, default=42)
+    p.add_argument("--checkpoint_dir", type=str, default="checkpoints/lntr_v2")
+    p.add_argument("--log_dir", type=str, default="outputs/tensorboard_v2")
+    p.add_argument("--plots_dir", type=str, default="outputs/plots_v2")
+    return p.parse_args()
 
 
-def train_epoch(
-    model_forward,
-    model_reverse,
-    dataloader,
-    optimizer,
-    loss_fn,
-    epoch,
-    device,
-):
+def train_epoch(model_forward, model_reverse, params, dataloader, optimizer,
+                scheduler, loss_fn, epoch, device, grad_clip):
     model_forward.train()
     model_reverse.train()
 
-    total_loss = 0.0
-    total_mse = 0.0
-    total_noisy = 0.0
-    total_cycle = 0.0
+    keys = ("l_total", "l_mse", "l_noisy_pred", "l_cycle")
+    sums = {k: 0.0 for k in keys}
+    n_ok = n_skipped = 0
+    gmax = 0.0
 
     pbar = tqdm(dataloader, desc=f"Epoch {epoch:02d} [Train]")
     for batch in pbar:
-        batch = batch.to(device)
-        optimizer.zero_grad()
+        batch = batch.to(device, non_blocking=True)
+        optimizer.zero_grad(set_to_none=True)
 
-        with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-            loss, loss_dict = loss_fn(model_forward, model_reverse, batch, epoch)
+        with torch.autocast(device_type="cuda", dtype=torch.bfloat16,
+                            enabled=device.type == "cuda"):
+            loss, d = loss_fn(model_forward, model_reverse, batch, epoch)
+
+        if not torch.isfinite(loss):
+            n_skipped += 1
+            continue
 
         loss.backward()
-        torch.nn.utils.clip_grad_norm_(
-            list(model_forward.parameters()) + list(model_reverse.parameters()),
-            1.0,
-        )
-        optimizer.step()
+        grad_norm = float(torch.nn.utils.clip_grad_norm_(params, grad_clip))
+        if not math.isfinite(grad_norm):
+            n_skipped += 1
+            optimizer.zero_grad(set_to_none=True)
+            continue
 
-        total_loss += loss_dict["l_total"]
-        total_mse += loss_dict["l_mse"]
-        total_noisy += loss_dict["l_noisy_pred"]
-        total_cycle += loss_dict["l_cycle"]
+        optimizer.step()
+        scheduler.step()
+
+        n_ok += 1
+        gmax = max(gmax, grad_norm)
+        for k in keys:
+            sums[k] += d[k]
 
         pbar.set_postfix({
-            "loss": f"{loss_dict['l_total']:.4f}",
-            "mse": f"{loss_dict['l_mse']:.4f}",
-            "noisy": f"{loss_dict['l_noisy_pred']:.4f}",
-            "cycle": f"{loss_dict['l_cycle']:.4f}",
-            "α": f"{loss_dict['alpha']:.2f}",
+            "loss": f"{d['l_total']:.3f}",
+            "mse": f"{d['l_mse']:.3f}",
+            "gn": f"{grad_norm:.2f}",
+            "a": f"{d['alpha']:.2f}",
         })
 
-    n = len(dataloader)
+    n = max(1, n_ok)
     return {
-        "loss": total_loss / n,
-        "mse": total_mse / n,
-        "noisy": total_noisy / n,
-        "cycle": total_cycle / n,
+        "loss": sums["l_total"] / n,
+        "mse": sums["l_mse"] / n,
+        "noisy": sums["l_noisy_pred"] / n,
+        "cycle": sums["l_cycle"] / n,
+        "gmax": gmax,
+        "skipped": n_skipped,
     }
 
 
 @torch.no_grad()
-def evaluate_and_save_plot(model_forward, model_reverse, dataloader, loss_fn, epoch, device, log_dir):
+def evaluate(model_forward, dataloader, device):
+    """Deterministic clean one-step teacher-forced MSE + copy-last-latent baseline."""
     model_forward.eval()
-    model_reverse.eval()
-
-    total_loss = 0.0
-    total_mse = 0.0
-    sample_true, sample_pred = None, None
+    se = persist_se = 0.0
+    count = 0
+    sample = None
 
     for batch in dataloader:
-        batch = batch.to(device)
-        with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-            loss, loss_dict = loss_fn(model_forward, model_reverse, batch, epoch)
-
-        total_loss += loss_dict["l_total"]
-        total_mse += loss_dict["l_mse"]
-
-        if sample_true is None:
-            inputs = batch[:, :-1]
-            targets = batch[:, 1:]
+        batch = batch.to(device, non_blocking=True)
+        inputs, targets = batch[:, :-1], batch[:, 1:]
+        with torch.autocast(device_type="cuda", dtype=torch.bfloat16,
+                            enabled=device.type == "cuda"):
             preds = model_forward(inputs)
-            sample_true = targets[0, :, 0].float().cpu().numpy()
-            sample_pred = preds[0, :, 0].float().cpu().numpy()
+        preds = preds.float()
 
-    # --- PLOT 1: Latest Trajectory Comparison (True vs Pred) ---
-    plots_dir = Path(log_dir).parent / "plots"
-    plots_dir.mkdir(parents=True, exist_ok=True)
-    
+        se += F.mse_loss(preds, targets, reduction="sum").item()
+        persist_se += F.mse_loss(inputs, targets, reduction="sum").item()
+        count += targets.numel()
+
+        if sample is None:
+            sample = (targets[0, :, 0].cpu().numpy(), preds[0, :, 0].cpu().numpy())
+
+    return {"mse": se / count, "persist_mse": persist_se / count}, sample
+
+
+def save_trajectory_plot(sample, epoch, mse, plots_dir):
+    true_traj, pred_traj = sample
     fig, ax = plt.subplots(figsize=(10, 5))
-    ax.plot(sample_true, label="True Latent ($z_{t+1}$)", color="blue", linewidth=2, marker="o")
-    ax.plot(sample_pred, label="Predicted Latent ($\hat{z}_{t+1}$)", color="orange", linestyle="--", linewidth=2, marker="x")
-    ax.set_title(f"Trajectory Comparison | Epoch {epoch} | MSE: {total_mse/len(dataloader):.4f}")
-    ax.set_xlabel("Time Step (T)")
-    ax.set_ylabel("Latent Feature Value (Dim 0)")
+    ax.plot(true_traj, label=r"True latent ($z_{t+1}$)", color="blue", linewidth=2, marker="o")
+    ax.plot(pred_traj, label=r"Predicted latent ($\hat{z}_{t+1}$)", color="orange",
+            linestyle="--", linewidth=2, marker="x")
+    ax.set_title(f"Trajectory Comparison | Epoch {epoch} | Val MSE: {mse:.4f}")
+    ax.set_xlabel("Time step")
+    ax.set_ylabel("Standardized latent value (channel 0)")
     ax.legend()
     ax.grid(True, alpha=0.3)
-    plt.savefig(plots_dir / "latest_trajectory.png", bbox_inches='tight')
+    plt.savefig(plots_dir / "latest_trajectory.png", bbox_inches="tight")
     plt.close(fig)
 
-    n = len(dataloader)
-    return {"loss": total_loss / n, "mse": total_mse / n}
 
-
-def save_training_curves_plot(history, log_dir):
-    """--- PLOT 2: Historical Loss & MSE across all epochs ---"""
-    plots_dir = Path(log_dir).parent / "plots"
-    plots_dir.mkdir(parents=True, exist_ok=True)
-    
+def save_training_curves_plot(history, plots_dir):
     fig, ax = plt.subplots(figsize=(10, 5))
-    epochs = history["epochs"]
-    
-    ax.plot(epochs, history["train_loss"], label="Train Total Loss", color="blue", linewidth=2)
-    ax.plot(epochs, history["val_loss"], label="Val Total Loss", color="orange", linewidth=2, linestyle="--")
-    ax.plot(epochs, history["train_mse"], label="Train MSE", color="green", linewidth=1.5, alpha=0.7)
-    ax.plot(epochs, history["val_mse"], label="Val MSE", color="red", linewidth=1.5, linestyle="--", alpha=0.7)
-    
-    ax.set_title("Training & Validation Metrics Across Epochs (Optimized)")
+    e = history["epochs"]
+    ax.plot(e, history["train_loss"], label="Train total loss", color="blue", linewidth=2)
+    ax.plot(e, history["train_mse"], label="Train MSE (clean)", color="green", alpha=0.8)
+    ax.plot(e, history["val_mse"], label="Val MSE (clean)", color="red", linestyle="--", linewidth=2)
+    ax.axhline(history["persist_mse"][-1], color="gray", linestyle=":",
+               label="Copy-last-latent baseline (val)")
+    ax.axhline(1.0, color="black", linestyle=":", alpha=0.4,
+               label="Predict-mean baseline (~1.0)")
+    ax.set_yscale("log")
+    ax.set_title("Training & Validation Metrics (standardized latents, log scale)")
     ax.set_xlabel("Epoch")
-    ax.set_ylabel("Loss / MSE Value")
+    ax.set_ylabel("Loss / MSE")
     ax.legend()
-    ax.grid(True, alpha=0.3)
-    
-    plt.savefig(plots_dir / "training_curves.png", bbox_inches='tight')
+    ax.grid(True, alpha=0.3, which="both")
+    plt.savefig(plots_dir / "training_curves.png", bbox_inches="tight")
     plt.close(fig)
 
 
 def main():
     args = parse_args()
+    torch.manual_seed(args.seed)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"=== Starting Optimized LN-TR Model Training on {device} (bfloat16 AMP) ===")
+    print(f"=== LN-TR training on {device} (bfloat16 AMP) ===")
 
     project_root = Path(__file__).resolve().parent.parent
     h5_train_path = project_root / args.h5_train
     h5_val_path = project_root / args.h5_val
     checkpoint_dir = project_root / args.checkpoint_dir
     log_dir = project_root / args.log_dir
+    plots_dir = project_root / args.plots_dir
+    for d in (checkpoint_dir, log_dir, plots_dir):
+        d.mkdir(parents=True, exist_ok=True)
 
-    checkpoint_dir.mkdir(parents=True, exist_ok=True)
-    log_dir.mkdir(parents=True, exist_ok=True)
+    # Per-channel standardization from TRAIN statistics only
+    print("[+] Computing latent statistics on the train split...")
+    mean, std = compute_latent_stats(h5_train_path)
+    print(f"[+] Channel std: min {std.min():.4f} | median {std.median():.4f} | max {std.max():.4f}")
 
-    # Datasets & Loaders
-    train_dataset = LatentSequenceDataset(h5_train_path)
-    val_dataset = LatentSequenceDataset(h5_val_path)
+    train_dataset = LatentSequenceDataset(h5_train_path, mean=mean, std=std)
+    val_dataset = LatentSequenceDataset(h5_val_path, mean=mean, std=std)
 
-    train_loader = DataLoader(
-        train_dataset,
+    loader_kwargs = dict(
         batch_size=args.batch_size,
-        shuffle=True,
         num_workers=args.num_workers,
         pin_memory=True,
+        persistent_workers=args.num_workers > 0,
     )
-    val_loader = DataLoader(
-        val_dataset,
-        batch_size=args.batch_size,
-        shuffle=False,
-        num_workers=args.num_workers,
-        pin_memory=True,
-    )
+    train_loader = DataLoader(train_dataset, shuffle=True, drop_last=True, **loader_kwargs)
+    val_loader = DataLoader(val_dataset, shuffle=False, **loader_kwargs)
+    print(f"[+] {len(train_dataset)} train | {len(val_dataset)} val clips")
 
-    print(
-        f"[+] Loaded Datasets: {len(train_dataset)} Train | {len(val_dataset)} Val clips"
-    )
-
-    # Models
     model_forward = CausalLatentPredictor(
-        input_dim=1024,
-        hidden_dim=args.hidden_dim,
-        num_layers=args.num_layers,
-        num_heads=args.num_heads,
+        input_dim=1024, hidden_dim=args.hidden_dim,
+        num_layers=args.num_layers, num_heads=args.num_heads,
     ).to(device)
-
     model_reverse = ReverseCycleHead(
         input_dim=1024, hidden_dim=args.hidden_dim, num_layers=3
     ).to(device)
 
     params = list(model_forward.parameters()) + list(model_reverse.parameters())
-    total_params = sum(p.numel() for p in params if p.requires_grad)
-    print(f"[+] Total Model Parameters: {total_params / 1e6:.2f}M")
+    print(f"[+] Total parameters: {sum(p.numel() for p in params if p.requires_grad) / 1e6:.2f}M")
 
-    # Loss & Optimizer (Balanced Weights & Softer Noise)
     loss_fn = UnifiedLNTRLoss(
-        lambda_noise=args.lambda_noise,
-        lambda_cycle=args.lambda_cycle,
-        alpha_min=args.alpha_min,
-        alpha_max=args.alpha_max,
-        max_epochs=args.epochs,
-        k_steps=args.k_steps,
+        lambda_noise=args.lambda_noise, lambda_cycle=args.lambda_cycle,
+        alpha_min=args.alpha_min, alpha_max=args.alpha_max,
+        max_epochs=args.epochs, k_steps=args.k_steps,
     ).to(device)
 
     optimizer = torch.optim.AdamW(
-        params, lr=args.lr, weight_decay=args.weight_decay
+        params, lr=args.lr, betas=(0.9, args.beta2), weight_decay=args.weight_decay
     )
 
-    # 3-Epoch Linear Warmup + Cosine Annealing Scheduler
-    def lr_lambda(current_epoch):
-        warmup_epochs = 3
-        if current_epoch < warmup_epochs:
-            return float(current_epoch + 1) / float(max(1, warmup_epochs))
-        progress = float(current_epoch - warmup_epochs) / float(max(1, args.epochs - warmup_epochs))
-        return max(0.0, 0.5 * (1.0 + math.cos(math.pi * progress)))
+    total_steps = args.epochs * len(train_loader)
+
+    def lr_lambda(step):  # per-iteration linear warmup + cosine decay
+        if step < args.warmup_steps:
+            return (step + 1) / args.warmup_steps
+        progress = (step - args.warmup_steps) / max(1, total_steps - args.warmup_steps)
+        return max(0.01, 0.5 * (1.0 + math.cos(math.pi * min(1.0, progress))))
 
     scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
     writer = SummaryWriter(log_dir=str(log_dir))
 
-    best_val_loss = float("inf")
-    
-    # History tracker for the historical curves plot
-    history = {
-        "epochs": [],
-        "train_loss": [],
-        "val_loss": [],
-        "train_mse": [],
-        "val_mse": []
-    }
+    best_val_mse = float("inf")
+    history = {"epochs": [], "train_loss": [], "train_mse": [], "val_mse": [], "persist_mse": []}
+
+    def make_ckpt(epoch, val_mse):
+        return {
+            "epoch": epoch,
+            "model_forward_state_dict": model_forward.state_dict(),
+            "model_reverse_state_dict": model_reverse.state_dict(),
+            "optimizer_state_dict": optimizer.state_dict(),
+            "val_mse": val_mse,
+            "latent_mean": mean,
+            "latent_std": std,
+            "args": vars(args),
+        }
 
     for epoch in range(1, args.epochs + 1):
-        train_metrics = train_epoch(
-            model_forward,
-            model_reverse,
-            train_loader,
-            optimizer,
-            loss_fn,
-            epoch,
-            device,
-        )
-        
-        val_metrics = evaluate_and_save_plot(
-            model_forward, model_reverse, val_loader, loss_fn, epoch, device, log_dir
-        )
-        
-        scheduler.step()
+        tm = train_epoch(model_forward, model_reverse, params, train_loader, optimizer,
+                         scheduler, loss_fn, epoch, device, args.grad_clip)
+        vm, sample = evaluate(model_forward, val_loader, device)
 
-        # Update history & save historical curves plot
         history["epochs"].append(epoch)
-        history["train_loss"].append(train_metrics["loss"])
-        history["val_loss"].append(val_metrics["loss"])
-        history["train_mse"].append(train_metrics["mse"])
-        history["val_mse"].append(val_metrics["mse"])
-        
-        save_training_curves_plot(history, log_dir)
+        history["train_loss"].append(tm["loss"])
+        history["train_mse"].append(tm["mse"])
+        history["val_mse"].append(vm["mse"])
+        history["persist_mse"].append(vm["persist_mse"])
 
-        # TensorBoard Logging
-        writer.add_scalar("Loss/Train_Total", train_metrics["loss"], epoch)
-        writer.add_scalar("Loss/Train_MSE", train_metrics["mse"], epoch)
-        writer.add_scalar("Loss/Val_Total", val_metrics["loss"], epoch)
-        writer.add_scalar("Loss/Val_MSE", val_metrics["mse"], epoch)
-        writer.add_scalar(
-            "LNTR/Alpha", loss_fn.lsni_scheduler.get_alpha(epoch), epoch
-        )
+        save_training_curves_plot(history, plots_dir)
+        if sample is not None:
+            save_trajectory_plot(sample, epoch, vm["mse"], plots_dir)
+
+        writer.add_scalar("Loss/Train_Total", tm["loss"], epoch)
+        writer.add_scalar("Loss/Train_MSE", tm["mse"], epoch)
+        writer.add_scalar("Loss/Val_MSE", vm["mse"], epoch)
+        writer.add_scalar("Baseline/Val_CopyLast_MSE", vm["persist_mse"], epoch)
+        writer.add_scalar("Opt/GradNorm_Max", tm["gmax"], epoch)
+        writer.add_scalar("Opt/LR", optimizer.param_groups[0]["lr"], epoch)
+        writer.add_scalar("LNTR/Alpha", loss_fn.lsni_scheduler.get_alpha(epoch), epoch)
 
         print(
-            f"Epoch {epoch:02d}/{args.epochs:02d} | Train Loss:"
-            f" {train_metrics['loss']:.4f} (MSE: {train_metrics['mse']:.4f}) | Val"
-            f" Loss: {val_metrics['loss']:.4f} (MSE: {val_metrics['mse']:.4f})"
+            f"Epoch {epoch:02d}/{args.epochs:02d} | Train {tm['loss']:.4f} "
+            f"(MSE {tm['mse']:.4f}, noisy {tm['noisy']:.4f}, cycle {tm['cycle']:.4f}) | "
+            f"Val MSE {vm['mse']:.4f} (copy-last {vm['persist_mse']:.4f}) | "
+            f"max|g| {tm['gmax']:.2f} | skipped {tm['skipped']}"
         )
 
-        # Save Best Checkpoint
-        if val_metrics["loss"] < best_val_loss:
-            best_val_loss = val_metrics["loss"]
-            best_path = checkpoint_dir / "lntr_full_best.pt"
-            torch.save(
-                {
-                    "epoch": epoch,
-                    "model_forward_state_dict": model_forward.state_dict(),
-                    "model_reverse_state_dict": model_reverse.state_dict(),
-                    "optimizer_state_dict": optimizer.state_dict(),
-                    "val_loss": val_metrics["loss"],
-                },
-                best_path,
-            )
-            print(
-                f"  [★] Saved new best checkpoint to {best_path.name} (Val Loss:"
-                f" {best_val_loss:.4f})"
-            )
+        torch.save(make_ckpt(epoch, vm["mse"]), checkpoint_dir / "lntr_full_last.pt")
+        if vm["mse"] < best_val_mse:
+            best_val_mse = vm["mse"]
+            torch.save(make_ckpt(epoch, vm["mse"]), checkpoint_dir / "lntr_full_best.pt")
+            print(f"  [★] New best checkpoint (Val MSE {best_val_mse:.4f})")
 
     writer.close()
-    print(
-        f"\n🎉 === Training Complete! Best Val Loss: {best_val_loss:.4f} ==="
-    )
+    print(f"\n=== Training complete. Best Val MSE: {best_val_mse:.4f} ===")
 
 
 if __name__ == "__main__":
