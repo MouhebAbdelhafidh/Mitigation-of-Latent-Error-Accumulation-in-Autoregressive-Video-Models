@@ -60,5 +60,9 @@ class LatentSequenceDataset(Dataset):
             latents = latents[: self.sequence_length]
 
         if self.mean is not None and self.std is not None:
-            latents = (latents - self.mean) / self.std
+            # Dynamically cast/move mean and std to match latents' device and dtype
+            mean = self.mean.to(latents.device, dtype=latents.dtype)
+            std = self.std.to(latents.device, dtype=latents.dtype)
+            latents = (latents - mean) / std
+            
         return latents
